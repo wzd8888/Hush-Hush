@@ -9,6 +9,7 @@ import {
 	deleteObject,
 	getObjectValue,
 	type ObjectMetadata,
+	patchObject,
 	updateObject,
 } from '#lib/api.js';
 import { TAGS_MAX_ITEMS } from '#lib/api-limits.js';
@@ -26,6 +27,7 @@ import { Label } from '#lib/components/ui/label/index.js';
 import { Textarea } from '#lib/components/ui/textarea/index.js';
 import { variantLabel } from '#lib/consumers.js';
 import { formatTimestamp } from '#lib/datetime.js';
+import { detailChanges } from '#lib/object-details.js';
 import { resolveRecipients, sealValue } from '#lib/sealing.js';
 import {
 	filterByTag,
@@ -183,11 +185,14 @@ let editId = $state('');
 // Only set when the name has several variants, so the dialog can say which.
 let editVariant = $state('');
 let editValue = $state('');
+// What the dialog opened with, so an untouched field isn't sent at all.
+let editInitial = { slug: '', description: '', tags: [] as string[] };
+let editNewSlug = $state('');
+let editDescription = $state('');
 let editTags = $state('');
-// What the field opened with, so an untouched field isn't sent at all.
-let editInitialTags: string[] = [];
 let editTagsError = $state('');
 let editUsedBy: string[] = $state([]);
+let editInitialUsedBy: string[] = [];
 let editEntries: ConsumerEntry[] = $state([]);
 let editError = $state('');
 // Independent of whatever a previous create or update on this same
@@ -196,6 +201,9 @@ let editError = $state('');
 // (api/openapi.yaml's KeepReadableCopy schema).
 let editKeepReadableCopy = $state(false);
 
+// Sealing only happens when a new value is typed; without one the dialog
+// edits details alone (id, description, tags) and the ciphertext stays.
+const editResealing = $derived(normalizeValue(editValue) !== '');
 const editRecipients = $derived(resolveRecipients(editUsedBy, editEntries));
 const editEffectiveRecipients = $derived(
 	editKeepReadableCopy && data.ownerPublicKey
@@ -205,18 +213,25 @@ const editEffectiveRecipients = $derived(
 
 function openEdit(object: ObjectMetadata) {
 	editSlug = object.slug;
+	editNewSlug = object.slug;
 	editId = object.id;
 	editVariant = variantLabelFor(object);
 	editValue = '';
+	editDescription = object.description ?? '';
 	// Copied, not the same array reference data.objects holds - the
 	// combobox mutates this in place as the user picks/adds consumers,
 	// and canceling shouldn't leave that mutation sitting on data the
 	// server never actually received.
 	editUsedBy = [...(object.used_by ?? [])];
+	editInitialUsedBy = [...editUsedBy];
 	editKeepReadableCopy = false;
 	editError = '';
-	editInitialTags = [...object.tags];
-	editTags = formatTags(editInitialTags);
+	editInitial = {
+		slug: object.slug,
+		description: object.description ?? '',
+		tags: [...object.tags],
+	};
+	editTags = formatTags(editInitial.tags);
 	editTagsError = '';
 	editOpen = true;
 }
@@ -232,29 +247,44 @@ async function submitEdit(event: SubmitEvent) {
 		return;
 	}
 
-	if (editEffectiveRecipients.length === 0) {
+	const plaintext = normalizeValue(editValue);
+	const changes = detailChanges(editInitial, {
+		slug: editNewSlug.trim(),
+		description: editDescription,
+		tags,
+	});
+
+	if (editResealing && editEffectiveRecipients.length === 0) {
 		editError =
 			'Add at least one consumer with a registered public key, or keep a readable copy for yourself, before saving this secret.';
 		return;
 	}
 
-	const plaintext = normalizeValue(editValue);
-	if (plaintext === '') {
-		editError = 'Enter a value.';
+	if (
+		!editResealing &&
+		editUsedBy.join(',') !== (editInitialUsedBy ?? []).join(',')
+	) {
+		editError = 'Enter a new value to change who can read this secret.';
 		return;
 	}
 
 	try {
-		const value = await sealValue(plaintext, editEffectiveRecipients);
-		await updateObject(
-			editSlug,
-			value,
-			editUsedBy,
-			editKeepReadableCopy,
-			// Omitted when the field is as it opened, which leaves the tags alone.
-			tags.join(',') === editInitialTags.join(',') ? undefined : tags,
-			editId,
-		);
+		if (editResealing) {
+			const value = await sealValue(plaintext, editEffectiveRecipients);
+			await updateObject(
+				editSlug,
+				value,
+				editUsedBy,
+				editKeepReadableCopy,
+				undefined,
+				editId,
+			);
+		}
+
+		if (changes) {
+			await patchObject(editSlug, editId, changes);
+		}
+
 		editOpen = false;
 		await invalidate('app:objects');
 		// An edit can introduce a consumer the directory page hasn't seen
@@ -757,15 +787,18 @@ async function confirmDelete() {
 		<form onsubmit={submitEdit}>
 			<div class="space-y-4">
 				<div class="space-y-1">
-					<Label for="edit-value">New value</Label>
-					<Textarea
-						id="edit-value"
-						class="w-full"
-						bind:value={editValue}
-						required
-						rows={6}
-						{...valueFieldAttributes}
-					/>
+					<Label for="edit-slug">Id</Label>
+					<Input id="edit-slug" class="w-full" bind:value={editNewSlug} required />
+					{#if editVariant}
+						<p class="text-sm text-text-muted">
+							Renaming moves every variant of this name.
+						</p>
+					{/if}
+				</div>
+
+				<div class="space-y-1">
+					<Label for="edit-description">Description</Label>
+					<Input id="edit-description" class="w-full" bind:value={editDescription} />
 				</div>
 
 				<div class="space-y-1">
@@ -790,6 +823,21 @@ async function confirmDelete() {
 				</div>
 
 				<div class="space-y-1">
+					<Label for="edit-value">New value (optional)</Label>
+					<Textarea
+						id="edit-value"
+						class="w-full"
+						bind:value={editValue}
+						rows={6}
+						{...valueFieldAttributes}
+					/>
+					<p class="text-sm text-text-muted">
+						Leave empty to keep the current value. Typing one replaces it, and
+						is the only way to change who can read it.
+					</p>
+				</div>
+
+				<div class="space-y-1">
 					<Label for="edit-used-by">Used by</Label>
 					<ConsumerCombobox
 						id="edit-used-by"
@@ -811,7 +859,7 @@ async function confirmDelete() {
 					</div>
 				{/if}
 
-				{#if editEffectiveRecipients.length === 0}
+				{#if editResealing && editEffectiveRecipients.length === 0}
 					<p role="alert" class="font-bold text-warning">
 						Add at least one consumer with a registered public key, or keep a
 						readable copy for yourself - a secret sealed to nobody could never
@@ -828,7 +876,7 @@ async function confirmDelete() {
 				<Dialog.Close class={buttonVariants({ variant: 'outline' })}>
 					Cancel
 				</Dialog.Close>
-				<Button type="submit" disabled={editEffectiveRecipients.length === 0}>
+				<Button type="submit" disabled={editResealing && editEffectiveRecipients.length === 0}>
 					Save
 				</Button>
 			</Dialog.Footer>

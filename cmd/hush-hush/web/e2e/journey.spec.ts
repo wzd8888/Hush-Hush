@@ -704,6 +704,65 @@ test('an authenticated visitor keeps the nav across pages, an anonymous one neve
 	await editDialog.waitFor({ state: 'hidden' });
 	await expect(page.locator('[data-testid="tag"]:visible')).toHaveCount(0);
 
+	// #784: id, description and tags change with no new value typed, and
+	// the sealed value is left alone.
+	await page.getByRole('button', { name: 'Edit' }).click();
+	const detailsDialog = page.getByRole('dialog', {
+		name: 'Edit mattermost_deploy_webhook',
+	});
+	await expect(detailsDialog.getByLabel('Id', { exact: true })).toHaveValue(
+		'mattermost_deploy_webhook',
+	);
+	await detailsDialog
+		.getByLabel('Description')
+		.fill('rotated by the on-call, see runbook');
+	await detailsDialog.locator('#edit-tags').fill('ops, rotated');
+	await detailsDialog.getByRole('button', { name: 'Save' }).click();
+	await detailsDialog.waitFor({ state: 'hidden' });
+	await expect(
+		page
+			.getByText('rotated by the on-call, see runbook')
+			.locator('visible=true'),
+	).toBeVisible();
+	await expect(page.locator('[data-testid="tag"]:visible')).toHaveText([
+		'ops',
+		'rotated',
+	]);
+
+	// A rename the server refuses shows its message and changes nothing.
+	await page.getByRole('button', { name: 'Edit' }).click();
+	await detailsDialog.getByLabel('Id', { exact: true }).fill('Not A Slug');
+	await detailsDialog.getByRole('button', { name: 'Save' }).click();
+	await expect(detailsDialog.getByRole('alert')).toBeVisible();
+	const detailsResults = await new AxeBuilder({ page })
+		.withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+		.analyze();
+	expect(detailsResults.violations).toEqual([]);
+
+	// A valid rename moves the row; rename back so later steps find it.
+	await detailsDialog
+		.getByLabel('Id', { exact: true })
+		.fill('mattermost_deploy_hook');
+	await detailsDialog.getByRole('button', { name: 'Save' }).click();
+	await detailsDialog.waitFor({ state: 'hidden' });
+	await expect(
+		page.getByRole('cell', { name: /^mattermost_deploy_hook/ }),
+	).toBeVisible();
+	await expect(
+		page.getByRole('cell', { name: /^mattermost_deploy_webhook/ }),
+	).toHaveCount(0);
+	await page.getByRole('button', { name: 'Edit' }).click();
+	const renamedDialog = page.getByRole('dialog', {
+		name: 'Edit mattermost_deploy_hook',
+	});
+	await renamedDialog
+		.getByLabel('Id', { exact: true })
+		.fill('mattermost_deploy_webhook');
+	await renamedDialog.locator('#edit-tags').fill('');
+	await renamedDialog.getByRole('button', { name: 'Save' }).click();
+	await renamedDialog.waitFor({ state: 'hidden' });
+	await expect(page.locator('[data-testid="tag"]:visible')).toHaveCount(0);
+
 	// The secret just created recorded "homelab" as a consumer - the
 	// directory's own filtering and select-to-filter navigation
 	// (alrayyes/hush-hush#252), plus its own axe-core scan.
@@ -1072,12 +1131,13 @@ test('an authenticated visitor keeps the nav across pages, an anonymous one neve
 	await page.getByRole('option', { name: 'admin', exact: true }).click();
 	await expect(page.getByText('actor: admin')).toBeVisible();
 	// Every row so far (the create, both "View" reads, the detail page's
-	// own read of the ciphertext (#480), all three edits) is
+	// own read of the ciphertext (#480), all three edits, and the details
+	// edit and two renames, #784) is
 	// now attributed to admin - waiting on the row count itself (not
 	// just the chip, which updates synchronously before the refetch
 	// resolves) avoids asserting against the table's still-unfiltered
 	// content.
-	await expect(rows).toHaveCount(7);
+	await expect(rows).toHaveCount(12);
 	for (const row of await rows.all()) {
 		await expect(row.getByRole('cell').nth(2)).toHaveText('admin');
 	}
@@ -1085,14 +1145,15 @@ test('an authenticated visitor keeps the nav across pages, an anonymous one neve
 	await actorTrigger.click();
 	await page.getByRole('option', { name: 'Any actor' }).click();
 	await expect(page.getByText('actor: admin')).toHaveCount(0);
-	await expect(rows).toHaveCount(7);
+	await expect(rows).toHaveCount(12);
 
 	await objectTrigger.click();
 	await page.getByRole('option', { name: 'mattermost_deploy_webhook' }).click();
 	await expect(
 		page.getByText('object: mattermost_deploy_webhook'),
 	).toBeVisible();
-	await expect(rows).toHaveCount(7);
+	// One of the two renames is logged under the temporary name, so it drops out here.
+	await expect(rows).toHaveCount(11);
 	for (const row of await rows.all()) {
 		await expect(row.getByRole('cell').first()).toHaveText(
 			'mattermost_deploy_webhook',
